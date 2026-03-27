@@ -620,8 +620,8 @@ def get_booted_sims():
             pass
 
     # Detect parallel test clones from XCTestDevices
-    # xcodebuild creates "Clone N of <device>" entries with active Runner processes
     xctest_devices = Path.home() / "Library/Developer/XCTestDevices"
+    clone_entries = []
     if xctest_devices.exists():
         for device_dir in xctest_devices.iterdir():
             if not device_dir.is_dir():
@@ -630,70 +630,62 @@ def get_booted_sims():
             if not plist.exists():
                 continue
             udid = device_dir.name
-            # Check if there's an active test runner for this clone
             runner_pid = run_cmd(
                 f"ps aux | grep '{udid}' | grep 'Runner' | grep -v grep | awk '{{print $2}}' | head -1",
                 timeout=2,
             )
-            # Read clone name from plist
             name = run_cmd(f"/usr/libexec/PlistBuddy -c 'Print :name' '{plist}' 2>/dev/null", timeout=2)
             if not name:
                 name = f"Clone ({udid[:8]})"
             runtime = run_cmd(f"/usr/libexec/PlistBuddy -c 'Print :runtime' '{plist}' 2>/dev/null", timeout=2)
             os_match = re.search(r"iOS[- .]([\d.]+)", runtime.replace("-", ".")) if runtime else None
             os_ver = os_match.group(1) if os_match else "?"
-            # Read per-worker test stats from session log
-            worker_passed = 0
-            worker_failed = 0
-            worker_last_test = ""
-            if runner_pid:
-                # Find session log via lsof on the runner PID
-                lsof_out = run_cmd(f"lsof -p {runner_pid} 2>/dev/null | grep 'Session-.*\\.log' | head -1", timeout=3)
-                session_path = ""
-                if lsof_out:
-                    match = re.search(r"(/\S+Session-\S+\.log)", lsof_out)
-                    if match:
-                        session_path = match.group(1)
-                if not session_path:
-                    # Fallback: find session logs in xcresult that contain this UDID path
-                    for pattern in [
-                        f"/Users/*/Documents/Projects/github-runner*/_work/_temp/*.xcresult/**/Session-*.log",
-                    ]:
-                        for sp in glob.glob(pattern, recursive=True):
-                            # Check if this log was recently modified (active)
-                            try:
-                                if time.time() - os.path.getmtime(sp) < 300:
-                                    session_path = sp
-                            except OSError:
-                                pass
-                if session_path and os.path.exists(session_path):
-                    try:
-                        with open(session_path, "r", errors="replace") as sf:
-                            for sline in sf:
-                                if "Test Case" in sline and "passed" in sline:
-                                    worker_passed += 1
-                                    m = re.search(r"'(.+?)'", sline)
-                                    if m:
-                                        worker_last_test = m.group(1).split(".")[-1]
-                                elif "Test Case" in sline and "failed" in sline:
-                                    worker_failed += 1
-                                    m = re.search(r"'(.+?)'", sline)
-                                    if m:
-                                        worker_last_test = m.group(1).split(".")[-1]
-                    except Exception:
-                        pass
+            clone_entries.append({
+                "name": name, "udid": udid[:8], "os": os_ver,
+                "state": f"PID:{runner_pid}" if runner_pid else "Idle",
+                "passed": 0, "failed": 0, "last_test": "",
+            })
 
-            sims.append(
-                {
-                    "name": name,
-                    "udid": udid[:8],
-                    "os": os_ver,
-                    "state": f"PID:{runner_pid}" if runner_pid else "Idle",
-                    "passed": worker_passed,
-                    "failed": worker_failed,
-                    "last_test": worker_last_test,
-                }
-            )
+    # Read ALL session logs — each worker has its own log with unique test results
+    worker_stats = []
+    for sp in sorted(glob.glob(
+        "/Users/*/Documents/Projects/github-runner*/_work/_temp/*.xcresult/**/Session-*.log",
+        recursive=True,
+    )):
+        try:
+            if time.time() - os.path.getmtime(sp) > 600:
+                continue
+        except OSError:
+            continue
+        wp = wf = 0
+        wlt = ""
+        try:
+            with open(sp, "r", errors="replace") as sf:
+                for sline in sf:
+                    if "Test Case" in sline and "passed" in sline:
+                        wp += 1
+                        m = re.search(r"'(.+?)'", sline)
+                        if m:
+                            wlt = m.group(1).split(".")[-1]
+                    elif "Test Case" in sline and "failed" in sline:
+                        wf += 1
+                        m = re.search(r"'(.+?)'", sline)
+                        if m:
+                            wlt = m.group(1).split(".")[-1]
+        except Exception:
+            continue
+        if wp + wf > 0:
+            worker_stats.append({"passed": wp, "failed": wf, "last_test": wlt})
+
+    # Assign worker stats to active clones by index
+    active_clones = [c for c in clone_entries if c["state"].startswith("PID:")]
+    for i, clone in enumerate(active_clones):
+        if i < len(worker_stats):
+            clone["passed"] = worker_stats[i]["passed"]
+            clone["failed"] = worker_stats[i]["failed"]
+            clone["last_test"] = worker_stats[i]["last_test"]
+
+    sims.extend(clone_entries)
 
     # Detect xcodebuild test destinations (fallback if no clones found)
     if not any(s["state"].startswith("PID:") for s in sims):
