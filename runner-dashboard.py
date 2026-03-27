@@ -1065,8 +1065,8 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
     num_cols = max(len(clone_data), 1)
     col_w = max((w - 2) // num_cols, 15)  # minimum 15 chars per column
 
-    # Fixed height: icon + name + separator + suite status + last test = 5 rows
-    content_rows = 5
+    # Fixed height: name + info + resources + separator + results + current test = 6 rows
+    content_rows = 6
     h = content_rows + 2  # borders
     draw_box(win, y, x, h, w, "Simulators & Tests")
 
@@ -1075,7 +1075,7 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
         avail = col_w - 2
         row = y + 1
 
-        # Row 1: status icon + clone name
+        # Status icon
         if sim["state"].startswith("PID:"):
             icon, icon_color = "▶", C_YELLOW
         elif sim["state"] == "Idle":
@@ -1085,48 +1085,81 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
         else:
             icon, icon_color = "○", C_CYAN
 
+        # Row 1: clone name + runner label
         clone_num = re.search(r"Clone (\d+)", sim["name"])
         parent = re.search(r"of (.+)", sim["name"])
-        if clone_num and parent:
-            label = f"C{clone_num.group(1)} {parent.group(1)}"
-        else:
-            label = sim["name"]
+        parent_name = parent.group(1) if parent else sim["name"]
+        clone_label = f"Clone {clone_num.group(1)}" if clone_num else sim["name"]
+
+        # Find which runner owns this clone
+        runner_label = ""
+        for rcfg in RUNNERS:
+            # "CI-iPhone" → runner-1, "CI-iPhone-2" → runner-2
+            if parent_name in rcfg.get("job_type", "") or parent_name in str(rcfg.get("path", "")):
+                runner_label = rcfg["label"]
+                break
+            # Match by index: CI-iPhone → runner-1, CI-iPhone-2 → runner-2
+            idx = RUNNERS.index(rcfg)
+            expected_dest = "CI-iPhone" if idx == 0 else f"CI-iPhone-{idx + 1}"
+            if parent_name == expected_dest:
+                runner_label = rcfg["label"]
+                break
+
         safe_addstr(win, row, cx, icon, curses.color_pair(icon_color) | curses.A_BOLD)
-        safe_addstr(win, row, cx + 2, label[:avail - 2], curses.color_pair(C_NORMAL))
+        safe_addstr(win, row, cx + 2, clone_label[:avail - 2], curses.color_pair(C_NORMAL) | curses.A_BOLD)
         row += 1
 
-        # Row 2: iOS version + PID
-        state_info = f"{sim['os']}"
+        # Row 2: runner + iOS
+        line2_parts = []
+        if runner_label:
+            line2_parts.append(runner_label)
+        line2_parts.append(f"iOS {sim['os']}")
+        safe_addstr(win, row, cx + 1, "  ".join(line2_parts)[:avail], curses.color_pair(C_DIM))
+        row += 1
+
+        # Row 3: PID + CPU + RAM (only for active clones)
         if sim["state"].startswith("PID:"):
-            state_info += f"  {sim['state']}"
-        safe_addstr(win, row, cx + 1, state_info[:avail], curses.color_pair(C_DIM))
+            pid = sim["state"].split(":")[1]
+            res_parts = [f"pid:{pid}"]
+            ps_info = run_cmd(f"ps -p {pid} -o %cpu=,rss= 2>/dev/null", timeout=2)
+            if ps_info.strip():
+                ps_parts = ps_info.split()
+                if len(ps_parts) >= 2:
+                    try:
+                        cpu = float(ps_parts[0])
+                        mem_mb = int(ps_parts[1]) / 1024
+                        cpu_color = C_GREEN if cpu < 50 else (C_YELLOW if cpu < 100 else C_RED)
+                        res_parts.append(f"cpu:{cpu:.0f}%")
+                        res_parts.append(f"ram:{mem_mb:.0f}M")
+                    except (ValueError, IndexError):
+                        pass
+            safe_addstr(win, row, cx + 1, "  ".join(res_parts)[:avail], curses.color_pair(C_DIM))
         row += 1
 
         # Row 3: separator
         safe_addstr(win, row, cx, "─" * avail, curses.color_pair(C_DIM))
         row += 1
 
-        # Row 4: test status
+        # Row 4: test results with labels
         if suite:
             total = suite["passed"] + suite["failed"]
             if suite["failed"] > 0:
-                tag = f"{suite['passed']}P {suite['failed']}F/{total}"
+                tag = f"pass:{suite['passed']} fail:{suite['failed']} total:{total}"
                 attr = C_RED
             else:
-                tag = f"{suite['passed']}P/{total}"
+                tag = f"pass:{suite['passed']} total:{total}"
                 attr = C_GREEN
             safe_addstr(win, row, cx + 1, tag[:avail], curses.color_pair(attr) | curses.A_BOLD)
         else:
             safe_addstr(win, row, cx + 1, "idle", curses.color_pair(C_DIM))
         row += 1
 
-        # Row 5: last test (truncated)
+        # Row 5: current test
         if suite and suite.get("last_test"):
             test_name = suite["last_test"]
-            # Extract just the method name
             if "]" in test_name:
                 test_name = test_name.split()[-1].rstrip("]")
-            safe_addstr(win, row, cx + 1, f"▸{test_name}"[:avail], curses.color_pair(C_DIM))
+            safe_addstr(win, row, cx + 1, f"▸ {test_name}"[:avail], curses.color_pair(C_DIM))
         row += 1
 
         # Column separator
