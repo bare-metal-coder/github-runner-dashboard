@@ -642,12 +642,56 @@ def get_booted_sims():
             runtime = run_cmd(f"/usr/libexec/PlistBuddy -c 'Print :runtime' '{plist}' 2>/dev/null", timeout=2)
             os_match = re.search(r"iOS[- .]([\d.]+)", runtime.replace("-", ".")) if runtime else None
             os_ver = os_match.group(1) if os_match else "?"
+            # Read per-worker test stats from session log
+            worker_passed = 0
+            worker_failed = 0
+            worker_last_test = ""
+            if runner_pid:
+                # Find session log via lsof on the runner PID
+                lsof_out = run_cmd(f"lsof -p {runner_pid} 2>/dev/null | grep 'Session-.*\\.log' | head -1", timeout=3)
+                session_path = ""
+                if lsof_out:
+                    match = re.search(r"(/\S+Session-\S+\.log)", lsof_out)
+                    if match:
+                        session_path = match.group(1)
+                if not session_path:
+                    # Fallback: find session logs in xcresult that contain this UDID path
+                    for pattern in [
+                        f"/Users/*/Documents/Projects/github-runner*/_work/_temp/*.xcresult/**/Session-*.log",
+                    ]:
+                        for sp in glob.glob(pattern, recursive=True):
+                            # Check if this log was recently modified (active)
+                            try:
+                                if time.time() - os.path.getmtime(sp) < 300:
+                                    session_path = sp
+                            except OSError:
+                                pass
+                if session_path and os.path.exists(session_path):
+                    try:
+                        with open(session_path, "r", errors="replace") as sf:
+                            for sline in sf:
+                                if "Test Case" in sline and "passed" in sline:
+                                    worker_passed += 1
+                                    m = re.search(r"'(.+?)'", sline)
+                                    if m:
+                                        worker_last_test = m.group(1).split(".")[-1]
+                                elif "Test Case" in sline and "failed" in sline:
+                                    worker_failed += 1
+                                    m = re.search(r"'(.+?)'", sline)
+                                    if m:
+                                        worker_last_test = m.group(1).split(".")[-1]
+                    except Exception:
+                        pass
+
             sims.append(
                 {
                     "name": name,
                     "udid": udid[:8],
                     "os": os_ver,
                     "state": f"PID:{runner_pid}" if runner_pid else "Idle",
+                    "passed": worker_passed,
+                    "failed": worker_failed,
+                    "last_test": worker_last_test,
                 }
             )
 
@@ -1065,8 +1109,8 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
     num_cols = max(len(clone_data), 1)
     col_w = max((w - 2) // num_cols, 15)  # minimum 15 chars per column
 
-    # Fixed height: name + info + resources + separator + results + current test = 6 rows
-    content_rows = 6
+    # Fixed height: name + info + resources + separator + results + test + summary = 7 rows
+    content_rows = 7
     h = content_rows + 2  # borders
     draw_box(win, y, x, h, w, "Simulators & Tests")
 
@@ -1140,26 +1184,30 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
         safe_addstr(win, row, cx, "─" * avail, curses.color_pair(C_DIM))
         row += 1
 
-        # Row 4: test results with labels
-        if suite:
-            total = suite["passed"] + suite["failed"]
-            if suite["failed"] > 0:
-                tag = f"pass:{suite['passed']} fail:{suite['failed']} total:{total}"
+        # Row 4: per-clone test results
+        wp = sim.get("passed", 0)
+        wf = sim.get("failed", 0)
+        wt = wp + wf
+        if wt > 0:
+            if wf > 0:
+                tag = f"pass:{wp} fail:{wf} ran:{wt}"
                 attr = C_RED
             else:
-                tag = f"pass:{suite['passed']} total:{total}"
+                tag = f"pass:{wp} ran:{wt}"
                 attr = C_GREEN
             safe_addstr(win, row, cx + 1, tag[:avail], curses.color_pair(attr) | curses.A_BOLD)
+        elif sim["state"].startswith("PID:"):
+            safe_addstr(win, row, cx + 1, "starting...", curses.color_pair(C_YELLOW))
         else:
             safe_addstr(win, row, cx + 1, "idle", curses.color_pair(C_DIM))
         row += 1
 
-        # Row 5: current test
-        if suite and suite.get("last_test"):
-            test_name = suite["last_test"]
-            if "]" in test_name:
-                test_name = test_name.split()[-1].rstrip("]")
-            safe_addstr(win, row, cx + 1, f"▸ {test_name}"[:avail], curses.color_pair(C_DIM))
+        # Row 5: current test (per-clone)
+        wlt = sim.get("last_test", "")
+        if wlt:
+            if "]" in wlt:
+                wlt = wlt.split()[-1].rstrip("]")
+            safe_addstr(win, row, cx + 1, f"▸ {wlt}"[:avail], curses.color_pair(C_DIM))
         row += 1
 
         # Column separator
@@ -1167,6 +1215,31 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
             sep_x = cx + col_w - 1
             for sy in range(y + 1, y + h - 1):
                 safe_addstr(win, sy, sep_x, "│", curses.color_pair(C_DIM))
+
+    # Summary row: total across all clones + suite elapsed
+    summary_row = y + h - 1  # use bottom border row
+    total_p = sum(s.get("passed", 0) for s, _ in clone_data)
+    total_f = sum(s.get("failed", 0) for s, _ in clone_data)
+    total_t = total_p + total_f
+    # Get suite total expected tests and elapsed from any matched suite
+    suite_elapsed = ""
+    suite_total_expected = ""
+    for _, suite in clone_data:
+        if suite:
+            suite_elapsed = suite.get("elapsed", "")
+            # Try xcresulttool for total expected count
+            break
+    if total_t > 0:
+        if total_f > 0:
+            summary = f" TOTAL: pass:{total_p} fail:{total_f} ran:{total_t}"
+            sattr = C_RED
+        else:
+            summary = f" TOTAL: pass:{total_p} ran:{total_t}"
+            sattr = C_GREEN
+        if suite_elapsed:
+            summary += f"  elapsed:{suite_elapsed}"
+        safe_addstr(win, summary_row, x + 2, summary[:w - 4],
+                    curses.color_pair(sattr) | curses.A_BOLD)
 
     return h
 
