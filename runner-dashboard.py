@@ -28,25 +28,69 @@ from pathlib import Path
 
 # -- Configuration ------------------------------------------------------------
 
-REPO = "bare-metal-coder/doorcash"
-REFRESH_INTERVAL = 4  # seconds
+REFRESH_INTERVAL = 15  # seconds
 
-RUNNERS = [
-    {
-        "name": "manas-mac",
-        "label": "runner-1",
-        "path": Path.home() / "Documents/Projects/github-runner",
-        "job_type": "Unit Tests",
-    },
-    {
-        "name": "manas-mac-2",
-        "label": "runner-2",
-        "path": Path.home() / "Documents/Projects/github-runner-2",
-        "job_type": "UI Tests",
-    },
-]
 
+def _discover_runners():
+    """Auto-detect self-hosted runners by scanning for actions-runner directories
+    in the home directory that contain a valid .runner config file."""
+    runners = []
+    repo = None
+    home = Path.home()
+
+    # Look for directories matching common runner path patterns
+    candidates = sorted(home.glob("actions-runner*"))
+    for path in candidates:
+        runner_file = path / ".runner"
+        if not runner_file.is_file():
+            continue
+        try:
+            cfg = json.loads(runner_file.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        name = cfg.get("agentName", "")
+        if not name:
+            continue
+
+        # Extract repo owner/name from gitHubUrl
+        gh_url = cfg.get("gitHubUrl", "")
+        if gh_url and repo is None:
+            # "https://github.com/owner/repo" -> "owner/repo"
+            parts = gh_url.rstrip("/").split("/")
+            if len(parts) >= 2:
+                repo = f"{parts[-2]}/{parts[-1]}"
+
+        # Resolve workFolder — may be absolute or relative to runner dir
+        work_folder = cfg.get("workFolder", "_work")
+        work_path = Path(work_folder) if os.path.isabs(work_folder) else path / work_folder
+
+        runners.append({
+            "name": name,
+            "path": path,
+            "work_path": work_path,
+        })
+
+    if not runners:
+        print("Error: No self-hosted runners found in ~/actions-runner*/", file=sys.stderr)
+        print("Each runner directory must contain a .runner config file.", file=sys.stderr)
+        sys.exit(1)
+
+    if not repo:
+        print("Error: Could not determine repository from runner config.", file=sys.stderr)
+        sys.exit(1)
+
+    return runners, repo
+
+
+RUNNERS, REPO = _discover_runners()
 LOCAL_RUNNER_NAMES = {r["name"] for r in RUNNERS}
+
+# Build glob patterns for CI log discovery from actual work paths
+_WORK_TEMP_DIRS = [str(r["work_path"] / "_temp") for r in RUNNERS]
+
+# Common prefix for shortening runner names in tight UI columns
+_runner_names = [r["name"] for r in RUNNERS]
+_RUNNER_PREFIX = os.path.commonprefix(_runner_names) if len(_runner_names) > 1 else ""
 
 # Cache: run_id -> list[JobInfo] for completed runs (they won't change)
 _job_cache: dict[int, list] = {}
@@ -57,9 +101,8 @@ _job_cache: dict[int, list] = {}
 @dataclass
 class RunnerStatus:
     name: str
-    label: str
-    job_type: str
     path: Path
+    label: str = ""
     pid: int = 0
     online: bool = False
     busy: bool = False
@@ -175,12 +218,12 @@ class LogCollector:
                     self._threads.append(t)
 
         # Also look for common CI log paths and xcresult session logs
-        for pattern in [
-            "/Users/*/Documents/Projects/github-runner*/_work/_temp/xcodebuild.log",
-            "/Users/*/Documents/Projects/github-runner*/_work/_temp/uitest.log",
-            "/tmp/uitest*.log",
-            "/Users/*/Documents/Projects/github-runner*/_work/_temp/*.xcresult/**/Session-*.log",
-        ]:
+        ci_patterns = ["/tmp/uitest*.log"]
+        for temp_dir in _WORK_TEMP_DIRS:
+            ci_patterns.append(f"{temp_dir}/xcodebuild.log")
+            ci_patterns.append(f"{temp_dir}/uitest.log")
+            ci_patterns.append(f"{temp_dir}/*.xcresult/**/Session-*.log")
+        for pattern in ci_patterns:
             for path in glob.glob(pattern):
                 if path not in self._tracked_pids:
                     self._tracked_pids.add(path)
@@ -373,8 +416,10 @@ def get_gh_runner_status():
         return {}
     try:
         runners = json.loads(out)
+        if not isinstance(runners, list):
+            return {}
         return {r["name"]: r for r in runners}
-    except (json.JSONDecodeError, KeyError):
+    except (json.JSONDecodeError, KeyError, TypeError):
         return {}
 
 
@@ -440,7 +485,9 @@ def get_workflow_runs(limit=12):
     raw_runs = []
     for line in out.strip().split("\n"):
         try:
-            raw_runs.append(json.loads(line))
+            d = json.loads(line)
+            if isinstance(d, dict) and "id" in d:
+                raw_runs.append(d)
         except json.JSONDecodeError:
             pass
 
@@ -648,10 +695,12 @@ def get_booted_sims():
 
     # Read ALL session logs — each worker has its own log with unique test results
     worker_stats = []
-    for sp in sorted(glob.glob(
-        "/Users/*/Documents/Projects/github-runner*/_work/_temp/*.xcresult/**/Session-*.log",
-        recursive=True,
-    )):
+    session_paths = []
+    for temp_dir in _WORK_TEMP_DIRS:
+        session_paths.extend(sorted(glob.glob(
+            f"{temp_dir}/*.xcresult/**/Session-*.log", recursive=True,
+        )))
+    for sp in session_paths:
         try:
             if time.time() - os.path.getmtime(sp) > 600:
                 continue
@@ -764,10 +813,10 @@ def get_test_suites():
 
         # Fallback: read from tee'd log files
         if passed == 0 and failed == 0:
-            for log_pattern in [
-                "/tmp/uitest*.log",
-                "/Users/*/Documents/Projects/github-runner*/_work/_temp/xcodebuild.log",
-            ]:
+            fallback_patterns = ["/tmp/uitest*.log"]
+            for temp_dir in _WORK_TEMP_DIRS:
+                fallback_patterns.append(f"{temp_dir}/xcodebuild.log")
+            for log_pattern in fallback_patterns:
                 for log_path in glob.glob(log_pattern):
                     try:
                         raw = subprocess.run(
@@ -814,8 +863,6 @@ def collect_all_data():
     for cfg in RUNNERS:
         rs = RunnerStatus(
             name=cfg["name"],
-            label=cfg["label"],
-            job_type=cfg["job_type"],
             path=cfg["path"],
         )
 
@@ -836,6 +883,12 @@ def collect_all_data():
             api_data = gh_status[cfg["name"]]
             rs.online = api_data.get("status") == "online"
             rs.busy = api_data.get("busy", False)
+            # Extract labels from the API (skip default "self-hosted" etc.)
+            api_labels = [
+                lbl["name"] for lbl in api_data.get("labels", [])
+                if lbl["name"] not in ("self-hosted", cfg["name"])
+            ]
+            rs.label = ", ".join(api_labels) if api_labels else ""
 
         state, job, last_time = get_runner_log_status(cfg["path"])
         if state == "busy":
@@ -1003,8 +1056,6 @@ def draw_runner_panel(win, y, x, w, runner, index):
     else:
         safe_addstr(win, row, col + 8, "idle", curses.color_pair(C_DIM))
 
-    safe_addstr(win, row, col + 22, "Type: ", curses.color_pair(C_DIM))
-    safe_addstr(win, row, col + 28, runner.job_type, curses.color_pair(C_CYAN))
     row += 1
 
     # PID and uptime
@@ -1127,18 +1178,17 @@ def draw_sim_and_tests_panel(win, y, x, w, sims, suites, wide=False):
         parent_name = parent.group(1) if parent else sim["name"]
         clone_label = f"Clone {clone_num.group(1)}" if clone_num else sim["name"]
 
-        # Find which runner owns this clone
+        # Find which runner owns this clone by matching path or index
         runner_label = ""
         for rcfg in RUNNERS:
-            # "CI-iPhone" → runner-1, "CI-iPhone-2" → runner-2
-            if parent_name in rcfg.get("job_type", "") or parent_name in str(rcfg.get("path", "")):
-                runner_label = rcfg["label"]
+            if parent_name in str(rcfg.get("path", "")):
+                runner_label = rcfg["name"]
                 break
-            # Match by index: CI-iPhone → runner-1, CI-iPhone-2 → runner-2
+            # Match by index: CI-iPhone → runner 0, CI-iPhone-2 → runner 1
             idx = RUNNERS.index(rcfg)
             expected_dest = "CI-iPhone" if idx == 0 else f"CI-iPhone-{idx + 1}"
             if parent_name == expected_dest:
-                runner_label = rcfg["label"]
+                runner_label = rcfg["name"]
                 break
 
         safe_addstr(win, row, cx, icon, curses.color_pair(icon_color) | curses.A_BOLD)
@@ -1437,7 +1487,7 @@ def draw_workflow_panel(win, y, x, w, runs, max_rows=20, selected_run_idx=-1):
                 curses.color_pair(C_NORMAL) | row_attr,
             )
 
-            runner_short = job.runner_name.replace("manas-mac", "mac")
+            runner_short = job.runner_name[len(_RUNNER_PREFIX):] if _RUNNER_PREFIX else job.runner_name
             safe_addstr(
                 win,
                 row,
